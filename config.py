@@ -48,7 +48,7 @@ class Config:
 
     # Loop
     total_iterations: int = 10000
-    device: str = "cpu"
+    device: str = "cuda"
 
     # Play mode
     play_simulations: int = 50
