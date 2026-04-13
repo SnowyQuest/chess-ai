@@ -1,5 +1,6 @@
 import os
 import time
+import pickle
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -23,33 +24,78 @@ class PGNDataset(Dataset):
     Lightweight in-memory PGN dataset.
 
     Stores only (fen, move_uci) string pairs in RAM — NOT encoded tensors.
-    encode_board() is called lazily inside __getitem__, which is executed
-    by DataLoader worker processes in parallel.
+    encode_board() is called lazily inside __getitem__, executed by DataLoader
+    worker processes in parallel.
 
     RAM usage: ~200 bytes/sample instead of 6656 bytes/sample.
     Example: 89 MB PGN ~ 500K samples -> ~100 MB RAM (vs ~3.3 GB if pre-encoded).
 
-    Use this for files up to streaming_threshold_mb (default 1500 MB).
+    Cache: scan results are saved to <pgn_path>.cache.pkl so that the second
+    run skips scanning entirely and loads in seconds.
     """
 
     def __init__(self, pgn_path: str):
         import chess.pgn
+        from tqdm import tqdm
 
-        log.info(f"Scanning PGNDataset: {pgn_path}")
+        cache_path = pgn_path + ".cache.pkl"
+
+        # -- Try loading from cache first --------------------------------------
+        if os.path.exists(cache_path):
+            cache_mtime = os.path.getmtime(cache_path)
+            pgn_mtime   = os.path.getmtime(pgn_path)
+            if cache_mtime >= pgn_mtime:
+                log.info(f"Loading PGNDataset from cache: {cache_path}")
+                with open(cache_path, "rb") as f:
+                    self.samples = pickle.load(f)
+                log.info(f"PGNDataset ready: {len(self):,} samples (from cache)")
+                return
+            else:
+                log.info("Cache is outdated — rescanning PGN file")
+
+        # -- Scan PGN with progress bar ----------------------------------------
+        file_size = os.path.getsize(pgn_path)
+        log.info(f"Scanning PGNDataset: {pgn_path} "
+                 f"({file_size / 1024 / 1024:.0f} MB)")
+
         self.samples = []   # list of (fen: str, move_uci: str)
 
         with open(pgn_path, "r", errors="replace") as f:
+            pbar = tqdm(
+                total=file_size,
+                unit="B", unit_scale=True, unit_divisor=1024,
+                desc="Scanning PGN",
+                colour="yellow",
+                dynamic_ncols=True,
+            )
+            last_pos = 0
+
             while True:
                 game = chess.pgn.read_game(f)
+
+                cur_pos = f.tell()
+                pbar.update(cur_pos - last_pos)
+                last_pos = cur_pos
+
                 if game is None:
                     break
+
                 board = game.board()
                 for move in game.mainline_moves():
                     self.samples.append((board.fen(), move.uci()))
                     board.push(move)
 
+            pbar.close()
+
         ram_mb = len(self.samples) * 200 / 1024 / 1024
         log.info(f"PGNDataset ready: {len(self):,} samples (~{ram_mb:.0f} MB RAM)")
+
+        # -- Save cache --------------------------------------------------------
+        log.info(f"Saving cache: {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(self.samples, f)
+        cache_mb = os.path.getsize(cache_path) / 1024 / 1024
+        log.info(f"Cache saved ({cache_mb:.0f} MB) — next run will skip scanning")
 
     def __len__(self):
         return len(self.samples)
@@ -74,30 +120,77 @@ class StreamingPGNDataset(Dataset):
     __getitem__ seeks to the game on disk and re-reads only what it needs.
     Lowest possible RAM usage at the cost of more disk I/O.
     Keep num_workers <= 2 to avoid disk contention.
+
+    Cache: the index list is saved to <pgn_path>.index.pkl so rescanning
+    is skipped on subsequent runs.
     """
 
     def __init__(self, pgn_path: str):
         import chess.pgn
+        from tqdm import tqdm
 
-        self.pgn_path = pgn_path
-        log.info(f"Scanning StreamingPGNDataset: {pgn_path}")
+        self.pgn_path  = pgn_path
+        cache_path     = pgn_path + ".index.pkl"
+
+        # -- Try loading index from cache -------------------------------------
+        if os.path.exists(cache_path):
+            cache_mtime = os.path.getmtime(cache_path)
+            pgn_mtime   = os.path.getmtime(pgn_path)
+            if cache_mtime >= pgn_mtime:
+                log.info(f"Loading StreamingPGNDataset index from cache: {cache_path}")
+                with open(cache_path, "rb") as f:
+                    self.index = pickle.load(f)
+                n_games = len({o for o, _ in self.index})
+                log.info(f"StreamingPGNDataset ready: {len(self):,} samples, "
+                         f"{n_games:,} games (from cache)")
+                return
+            else:
+                log.info("Index cache is outdated — rescanning PGN file")
+
+        # -- Scan PGN with progress bar ----------------------------------------
+        file_size = os.path.getsize(pgn_path)
+        log.info(f"Scanning StreamingPGNDataset: {pgn_path} "
+                 f"({file_size / 1024 / 1024:.0f} MB)")
 
         # index: list of (game_byte_offset, move_index_in_game)
         self.index = []
 
         with open(pgn_path, "r", errors="replace") as f:
+            pbar = tqdm(
+                total=file_size,
+                unit="B", unit_scale=True, unit_divisor=1024,
+                desc="Scanning PGN",
+                colour="yellow",
+                dynamic_ncols=True,
+            )
+            last_pos = 0
+
             while True:
                 offset = f.tell()
                 game   = chess.pgn.read_game(f)
+
+                cur_pos = f.tell()
+                pbar.update(cur_pos - last_pos)
+                last_pos = cur_pos
+
                 if game is None:
                     break
+
                 n_moves = sum(1 for _ in game.mainline_moves())
                 for i in range(n_moves):
                     self.index.append((offset, i))
 
+            pbar.close()
+
         n_games = len({o for o, _ in self.index})
         log.info(f"StreamingPGNDataset ready: {len(self):,} samples, "
                  f"{n_games:,} games")
+
+        # -- Save index cache --------------------------------------------------
+        log.info(f"Saving index cache: {cache_path}")
+        with open(cache_path, "wb") as f:
+            pickle.dump(self.index, f)
+        log.info("Index cache saved — next run will skip scanning")
 
     def __len__(self):
         return len(self.index)
