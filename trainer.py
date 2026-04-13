@@ -20,18 +20,23 @@ log = get_logger("trainer")
 
 class PGNDataset(Dataset):
     """
-    In-memory PGN dataset for small/medium files (< ~1.5 GB).
-    Loads all (state, move_id) pairs upfront into numpy arrays.
-    DataLoader workers slice with zero encoding overhead.
+    Lightweight in-memory PGN dataset.
+
+    Stores only (fen, move_uci) string pairs in RAM — NOT encoded tensors.
+    encode_board() is called lazily inside __getitem__, which is executed
+    by DataLoader worker processes in parallel.
+
+    RAM usage: ~200 bytes/sample instead of 6656 bytes/sample.
+    Example: 89 MB PGN ~ 500K samples -> ~100 MB RAM (vs ~3.3 GB if pre-encoded).
+
+    Use this for files up to streaming_threshold_mb (default 1500 MB).
     """
 
     def __init__(self, pgn_path: str):
         import chess.pgn
-        from board import encode_board
-        from moves import move_to_id
 
-        log.info(f"Loading PGNDataset: {pgn_path}")
-        states, move_ids = [], []
+        log.info(f"Scanning PGNDataset: {pgn_path}")
+        self.samples = []   # list of (fen: str, move_uci: str)
 
         with open(pgn_path, "r", errors="replace") as f:
             while True:
@@ -40,27 +45,35 @@ class PGNDataset(Dataset):
                     break
                 board = game.board()
                 for move in game.mainline_moves():
-                    states.append(encode_board(board))
-                    move_ids.append(move_to_id(move))
+                    self.samples.append((board.fen(), move.uci()))
                     board.push(move)
 
-        self.states   = np.array(states,   dtype=np.float32)  # (N, 26, 8, 8)
-        self.move_ids = np.array(move_ids, dtype=np.int64)    # (N,)
-        log.info(f"PGNDataset ready: {len(self):,} samples")
+        ram_mb = len(self.samples) * 200 / 1024 / 1024
+        log.info(f"PGNDataset ready: {len(self):,} samples (~{ram_mb:.0f} MB RAM)")
 
     def __len__(self):
-        return len(self.move_ids)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        return self.states[idx], self.move_ids[idx]
+        import chess
+        from board import encode_board
+        from moves import move_to_id
+
+        fen, move_uci = self.samples[idx]
+        board = chess.Board(fen)
+        move  = chess.Move.from_uci(move_uci)
+        state = encode_board(board)
+        return state, np.int64(move_to_id(move))
 
 
 class StreamingPGNDataset(Dataset):
     """
-    Streaming PGN dataset for large files (> ~1.5 GB).
-    First pass collects (file_offset, move_index) pairs.
-    __getitem__ re-reads only the required game on demand — low RAM usage.
-    Keep num_workers <= 2 to avoid disk I/O contention.
+    Streaming PGN dataset for very large files (> ~1.5 GB).
+
+    First pass collects (file_offset, move_index_in_game) index pairs.
+    __getitem__ seeks to the game on disk and re-reads only what it needs.
+    Lowest possible RAM usage at the cost of more disk I/O.
+    Keep num_workers <= 2 to avoid disk contention.
     """
 
     def __init__(self, pgn_path: str):
@@ -69,8 +82,8 @@ class StreamingPGNDataset(Dataset):
         self.pgn_path = pgn_path
         log.info(f"Scanning StreamingPGNDataset: {pgn_path}")
 
-        # index: list of (game_offset, move_index_in_game)
-        self.index: list = []
+        # index: list of (game_byte_offset, move_index_in_game)
+        self.index = []
 
         with open(pgn_path, "r", errors="replace") as f:
             while True:
@@ -90,6 +103,7 @@ class StreamingPGNDataset(Dataset):
         return len(self.index)
 
     def __getitem__(self, idx):
+        import chess
         import chess.pgn
         from board import encode_board
         from moves import move_to_id
@@ -105,7 +119,7 @@ class StreamingPGNDataset(Dataset):
                 return encode_board(board), np.int64(move_to_id(move))
             board.push(move)
 
-        # Fallback (should never be reached)
+        # Fallback — should never be reached
         return np.zeros((26, 8, 8), dtype=np.float32), np.int64(0)
 
 
@@ -173,9 +187,8 @@ class Trainer:
         """
         Supervised pretraining from a PGN file (policy head only).
 
-        Uses torch.utils.data.DataLoader with parallel CPU workers so that
-        board encoding runs in the background and the GPU/CPU trainer is
-        never starved waiting for data.
+        DataLoader with parallel CPU workers encodes boards in the background
+        so the trainer (GPU or CPU) is never waiting for data.
 
         Parameters
         ----------
@@ -184,64 +197,56 @@ class Trainer:
         epochs : int
             Number of full passes over the dataset.
         watch : bool
-            Print a live board to the terminal each move (forces num_workers=0
-            because tty output from worker processes is unreliable).
+            Replay games move-by-move in the terminal after training.
+            Forces num_workers=0 during training (tty output from worker
+            processes is unreliable).
         num_workers : int
-            DataLoader worker processes for parallel encoding.
-            Automatically set to 0 on CPU-only runs (no benefit) and capped
-            at 2 for streaming mode (disk I/O bound).
+            DataLoader worker processes for parallel board encoding.
+            Auto-set to 0 on CPU-only runs and capped at 2 in streaming mode.
             Set to 0 manually for debugging or Windows compatibility.
         streaming_threshold_mb : int
-            Files larger than this (MB) use StreamingPGNDataset (low RAM).
-            Files smaller are loaded fully into RAM for faster access.
+            Files larger than this use StreamingPGNDataset (disk-based,
+            very low RAM). Smaller files use PGNDataset (FEN strings in RAM).
         """
         from tqdm import tqdm
 
-        on_gpu     = self.device != "cpu" and torch.cuda.is_available()
-        file_mb    = os.path.getsize(pgn_path) / 1024 / 1024
+        on_gpu  = self.device != "cpu" and torch.cuda.is_available()
+        file_mb = os.path.getsize(pgn_path) / 1024 / 1024
 
         log.info(f"PGN training: {pgn_path} ({file_mb:.0f} MB) | "
                  f"device={self.device} | epochs={epochs}")
 
-        # ── Select dataset ──────────────────────────────────────────
+        # -- Select dataset ----------------------------------------------------
         if file_mb > streaming_threshold_mb:
-            log.info("Large file — using StreamingPGNDataset (low RAM mode)")
-            dataset = StreamingPGNDataset(pgn_path)
-            # Disk I/O is the bottleneck; more workers don't help much
-            effective_workers = min(num_workers, 2)
+            log.info("Large file detected — using StreamingPGNDataset (low RAM mode)")
+            dataset           = StreamingPGNDataset(pgn_path)
+            effective_workers = min(num_workers, 2)   # disk I/O bound
         else:
-            dataset = PGNDataset(pgn_path)
+            dataset           = PGNDataset(pgn_path)
             effective_workers = num_workers
 
-        # watch mode needs stdout from the main process
+        # watch mode requires stdout from the main process
         if watch:
             effective_workers = 0
 
-        # No benefit from workers on CPU-only training
+        # Worker processes bring no benefit on CPU-only training
         if not on_gpu:
             effective_workers = 0
 
-        log.info(f"DataLoader: batch={cfg.batch_size} | "
-                 f"workers={effective_workers} | "
-                 f"pin_memory={on_gpu}")
+        log.info(f"DataLoader: batch_size={cfg.batch_size} | "
+                 f"workers={effective_workers} | pin_memory={on_gpu}")
 
         loader = DataLoader(
             dataset,
             batch_size=cfg.batch_size,
             shuffle=True,
             num_workers=effective_workers,
-            pin_memory=on_gpu,           # zero-copy CPU→GPU transfer
+            pin_memory=on_gpu,                               # zero-copy CPU->GPU transfer
             prefetch_factor=4 if effective_workers > 0 else None,
             persistent_workers=(effective_workers > 0),
         )
 
-        # ── Watch-mode helpers ──────────────────────────────────────
-        if watch:
-            import chess
-            import chess.pgn
-            from board import display_board, clear_screen
-
-        # ── Training loop ────────────────────────────────────────────
+        # -- Training loop -----------------------------------------------------
         for epoch in range(epochs):
             t_start     = time.time()
             loss_window = []
@@ -256,17 +261,16 @@ class Trainer:
                 dynamic_ncols=True,
             )
 
-            for states_np, targets_np in pbar:
-                # states_np / targets_np are already tensors when coming
-                # from DataLoader; keep as-is and just move to device.
-                if isinstance(states_np, np.ndarray):
-                    states_t  = torch.from_numpy(states_np).to(
+            for states_batch, targets_batch in pbar:
+                # Move tensors to device (non_blocking for async GPU transfer)
+                if isinstance(states_batch, np.ndarray):
+                    states_t  = torch.from_numpy(states_batch).to(
                         self.device, non_blocking=on_gpu)
-                    targets_t = torch.from_numpy(targets_np).to(
+                    targets_t = torch.from_numpy(targets_batch).to(
                         self.device, non_blocking=on_gpu)
                 else:
-                    states_t  = states_np.to(self.device, non_blocking=on_gpu)
-                    targets_t = targets_np.to(self.device, non_blocking=on_gpu)
+                    states_t  = states_batch.to(self.device, non_blocking=on_gpu)
+                    targets_t = targets_batch.to(self.device, non_blocking=on_gpu)
 
                 self.model.train()
                 self.optimizer.zero_grad()
@@ -275,6 +279,7 @@ class Trainer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 self.optimizer.step()
+
                 self.step   += 1
                 total_moves += states_t.size(0)
 
@@ -287,16 +292,10 @@ class Trainer:
                 spd     = total_moves / elapsed if elapsed > 0 else 0
 
                 pbar.set_postfix({
-                    "loss": f"{recent_loss:.4f}",
+                    "loss":  f"{recent_loss:.4f}",
                     "pos/s": f"{spd:.0f}",
-                    "step": self.step,
+                    "step":  self.step,
                 }, refresh=False)
-
-                # ── Watch mode (workers=0, sequential) ───────────────
-                if watch:
-                    # Re-read the last batch's first position for display
-                    # (approximate; exact board display requires sequential mode)
-                    pass   # board display is handled below in sequential path
 
             pbar.close()
 
@@ -309,27 +308,23 @@ class Trainer:
                 f"{total_moves / elapsed:.0f} pos/s"
             )
 
-        # ── Watch mode: sequential replay for terminal display ───────
-        # Run a second, display-only pass when watch=True.
-        # This is separate so the fast path above is never slowed down.
-        # If you only need watch mode, pass watch=True and accept that
-        # it runs single-threaded.
+        # -- Watch mode: terminal board replay after training ------------------
         if watch:
             self._watch_pgn(pgn_path)
 
     # ------------------------------------------------------------------
-    # Watch helper (sequential, display only — not used for training)
+    # Terminal board display (watch mode)
     # ------------------------------------------------------------------
 
     def _watch_pgn(self, pgn_path: str):
         """
-        Display PGN games move-by-move in the terminal.
-        Called automatically when train_pgn(..., watch=True).
+        Replay PGN games move-by-move in the terminal.
+        Called automatically after train_pgn(..., watch=True).
+        This is display-only — no training happens here.
         """
         import chess
         import chess.pgn
-        from board import encode_board, display_board, clear_screen
-        from moves import move_to_id
+        from board import display_board, clear_screen
 
         log.info("Watch mode: replaying PGN for terminal display...")
 
