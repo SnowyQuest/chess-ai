@@ -10,6 +10,7 @@ if __name__ == "__main__":
     parser.add_argument("--res_blocks", type=int, default=10)
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--max_samples", type=int, default=None)
+    parser.add_argument("--cache", type=str, default=None, help="Path to dataset cache file (.pt)")
     args = parser.parse_args()
     
     os.makedirs("checkpoints", exist_ok=True)

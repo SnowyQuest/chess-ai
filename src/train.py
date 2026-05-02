@@ -13,7 +13,8 @@ def train(args):
     print(f"Using device: {device}")
 
     # Load dataset
-    dataset = ChessDataset([args.pgn], max_samples=args.max_samples)
+    cache_path = args.cache if args.cache else None
+    dataset = ChessDataset([args.pgn], max_samples=args.max_samples, cache_path=cache_path)
     if len(dataset) == 0:
         print("Dataset is empty. Check PGN file path.")
         return
@@ -28,7 +29,7 @@ def train(args):
     model = ChessNet(num_residual_blocks=args.res_blocks, channels=args.channels).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
     
     criterion_policy = nn.CrossEntropyLoss()
     criterion_value = nn.MSELoss()
@@ -43,7 +44,7 @@ def train(args):
             tensors, move_indices, outcomes = tensors.to(device), move_indices.to(device), outcomes.to(device)
             
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
                 policy_logits, value_output = model(tensors)
                 loss_policy = criterion_policy(policy_logits, move_indices)
                 loss_value = criterion_value(value_output, outcomes)

@@ -6,8 +6,18 @@ from .move_encoder import get_move_index
 import os
 
 class ChessDataset(Dataset):
-    def __init__(self, pgn_files, max_samples=None, deduplicate=True):
+    def __init__(self, pgn_files, max_samples=None, deduplicate=True, cache_path=None):
         self.samples = []
+        
+        # Try loading from cache
+        if cache_path and os.path.exists(cache_path):
+            print(f"Loading dataset from cache: {cache_path}")
+            self.samples = torch.load(cache_path)
+            if max_samples:
+                self.samples = self.samples[:max_samples]
+            return
+
+        print("Parsing PGN files (this may take a while)...")
         seen_fens = set() if deduplicate else None
         for pgn_file in pgn_files:
             if not os.path.exists(pgn_file):
@@ -29,16 +39,19 @@ class ChessDataset(Dataset):
                         
                     board = game.board()
                     for move in game.mainline_moves():
-                        fen = board.fen()
-                        if not deduplicate or fen not in seen_fens:
-                            # Store from perspective of player to move
+                        # Use first 4 fields of FEN
+                        fen_parts = board.fen().split()
+                        clean_fen = " ".join(fen_parts[:4]) + " 0 1"
+                        
+                        if not deduplicate or clean_fen not in seen_fens:
                             current_outcome = res if board.turn == chess.WHITE else -res
                             
                             try:
                                 move_idx = get_move_index(move, board.turn)
-                                self.samples.append((fen, move_idx, current_outcome))
+                                # Store as tuple of (fen, move_idx, outcome)
+                                self.samples.append((clean_fen, move_idx, current_outcome))
                                 if deduplicate:
-                                    seen_fens.add(fen)
+                                    seen_fens.add(clean_fen)
                             except Exception:
                                 pass
                             
@@ -47,6 +60,12 @@ class ChessDataset(Dataset):
                             break
                     if max_samples and len(self.samples) >= max_samples:
                         break
+        
+        # Save to cache if requested
+        if cache_path:
+            print(f"Saving dataset to cache: {cache_path}")
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            torch.save(self.samples, cache_path)
 
     def __len__(self):
         return len(self.samples)
