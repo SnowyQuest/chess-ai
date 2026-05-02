@@ -9,9 +9,10 @@ from src.engine import select_move
 app = Flask(__name__)
 CORS(app)
 
-# Global variables for model and device
+# Global variables for model, device, and args
 model = None
 device = None
+args = None
 
 def load_model(model_path, res_blocks, channels):
     global model, device
@@ -39,17 +40,19 @@ def get_move():
     if not fen:
         return jsonify({"error": "No FEN provided"}), 400
     
-    try {
+    try:
         board = chess.Board(fen)
+        # Use args.depth from the global scope
         move = select_move(model, board, device=device, depth=args.depth)
         return jsonify({
             "move": move.uci(),
             "san": board.san(move)
         })
     except Exception as e:
+        print(f"Error processing move: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
-    if __name__ == "__main__":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--res_blocks", type=int, default=10)
@@ -57,7 +60,6 @@ def get_move():
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--depth", type=int, default=2, help="Search depth (default: 2)")
     args = parser.parse_args()
-
     
     load_model(args.model, args.res_blocks, args.channels)
     app.run(host="0.0.0.0", port=args.port)
