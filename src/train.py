@@ -27,6 +27,11 @@ def train(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=4)
     
     model = ChessNet(num_residual_blocks=args.res_blocks, channels=args.channels).to(device)
+    
+    if args.resume and os.path.exists(args.resume):
+        print(f"Resuming training from: {args.resume}")
+        model.load_state_dict(torch.load(args.resume, map_location=device))
+    
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = torch.amp.GradScaler('cuda' if torch.cuda.is_available() else 'cpu')
