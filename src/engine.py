@@ -16,23 +16,28 @@ def evaluate_board(model, board, device):
     _, value = model(tensor)
     return value.item()
 
-def minimax(model, board, depth, alpha, beta, maximizing_player, device):
+def minimax(model, board, depth, alpha, beta, maximizing_player, device, top_k=5):
     if depth == 0 or board.is_game_over():
-        # Evaluate from perspective of the side who just moved
-        # Value head is trained to output from perspective of side to move
-        val = evaluate_board(model, board, device)
-        # If it's not the maximizing player's turn, we need to negate the value?
-        # Actually, let's keep it simple: Value head returns V for the player to move.
-        # If we reached here and it's maximizing_player's turn, we want to maximize that V.
-        return val if maximizing_player else -val
+        return evaluate_board(model, board, device)
+
+    # Get policy logits to order/filter moves
+    tensor = board_to_tensor(board).unsqueeze(0).to(device)
+    policy_logits, _ = model(tensor)
+    mask = get_legal_move_mask(board).to(device)
+    policy_logits[0, ~mask] = -1e9
+    
+    # Filter to top_k moves
+    probs = torch.softmax(policy_logits, dim=1)
+    k = min(top_k, board.legal_moves.count())
+    _, top_indices = torch.topk(probs, k=k)
 
     if maximizing_player:
         max_eval = -float('inf')
-        # To keep "style", we could sort moves by policy head, but for depth 2-3, 
-        # full legal moves is fine.
-        for move in board.legal_moves:
+        for idx in top_indices[0]:
+            move = index_to_move(idx.item(), board)
+            if move is None: continue
             board.push(move)
-            eval = minimax(model, board, depth - 1, alpha, beta, False, device)
+            eval = minimax(model, board, depth - 1, alpha, beta, False, device, top_k=max(2, top_k-1))
             board.pop()
             max_eval = max(max_eval, eval)
             alpha = max(alpha, eval)
@@ -41,9 +46,11 @@ def minimax(model, board, depth, alpha, beta, maximizing_player, device):
         return max_eval
     else:
         min_eval = float('inf')
-        for move in board.legal_moves:
+        for idx in top_indices[0]:
+            move = index_to_move(idx.item(), board)
+            if move is None: continue
             board.push(move)
-            eval = minimax(model, board, depth - 1, alpha, beta, True, device)
+            eval = minimax(model, board, depth - 1, alpha, beta, True, device, top_k=max(2, top_k-1))
             board.pop()
             min_eval = min(min_eval, eval)
             beta = min(beta, eval)
@@ -53,34 +60,33 @@ def minimax(model, board, depth, alpha, beta, maximizing_player, device):
 
 def select_move(model, board, device='cpu', epsilon=0.0, depth=2):
     """
-    Selects a move using a hybrid approach:
-    1. Get top moves from Policy Head (Magnus Style)
-    2. Use Minimax (depth 2) to verify they aren't blunders.
+    Selects a move using a high-speed hybrid approach:
+    - Branching is limited to top-k 'Magnus' moves.
+    - Depth is kept shallow for human-like response times.
     """
     model.eval()
     with torch.no_grad():
-        # Policy Head for "Instinct"
+        # Get moves from the perspective of the player to move
         tensor = board_to_tensor(board).unsqueeze(0).to(device)
         policy_logits, _ = model(tensor)
-        
         mask = get_legal_move_mask(board).to(device)
         policy_logits[0, ~mask] = -1e9
         
-        # Get top 5 moves to consider (keeps the "Magnus style")
         probs = torch.softmax(policy_logits, dim=1)
-        top_probs, top_indices = torch.topk(probs, k=min(5, board.legal_moves.count()))
+        # Search the top 5 moves for the best tactical result
+        k = min(5, board.legal_moves.count())
+        _, top_indices = torch.topk(probs, k=k)
         
         best_move = None
         max_val = -float('inf')
         
-        # Use Minimax to pick the best among the top "stylish" moves
         for idx in top_indices[0]:
             move = index_to_move(idx.item(), board)
             if move is None: continue
             
             board.push(move)
-            # We want to minimize the opponent's response
-            val = minimax(model, board, depth - 1, -float('inf'), float('inf'), False, device)
+            # Minimize opponent's best response (within their top moves)
+            val = minimax(model, board, depth - 1, -float('inf'), float('inf'), False, device, top_k=3)
             board.pop()
             
             if val > max_val:
