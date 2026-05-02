@@ -17,7 +17,7 @@ def play(args):
     while not board.is_game_over():
         print("\n", board)
         if board.turn == ai_color:
-            move = select_move(model, board, device=device)
+            move = select_move(model, board, device=device, depth=args.depth)
             print(f"\nAI moves: {move}")
             board.push(move)
         else:
@@ -40,5 +40,6 @@ if __name__ == "__main__":
     parser.add_argument("--color", type=str, default="white", choices=["white", "black"])
     parser.add_argument("--res_blocks", type=int, default=10)
     parser.add_argument("--channels", type=int, default=128)
+    parser.add_argument("--depth", type=int, default=2, help="Search depth (default: 2)")
     args = parser.parse_args()
     play(args)

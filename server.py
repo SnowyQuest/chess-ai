@@ -39,9 +39,9 @@ def get_move():
     if not fen:
         return jsonify({"error": "No FEN provided"}), 400
     
-    try:
+    try {
         board = chess.Board(fen)
-        move = select_move(model, board, device=device)
+        move = select_move(model, board, device=device, depth=args.depth)
         return jsonify({
             "move": move.uci(),
             "san": board.san(move)
@@ -49,13 +49,15 @@ def get_move():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-if __name__ == "__main__":
+    if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--res_blocks", type=int, default=10)
     parser.add_argument("--channels", type=int, default=128)
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--depth", type=int, default=2, help="Search depth (default: 2)")
     args = parser.parse_args()
+
     
     load_model(args.model, args.res_blocks, args.channels)
     app.run(host="0.0.0.0", port=args.port)
